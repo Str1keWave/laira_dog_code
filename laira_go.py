@@ -19,6 +19,8 @@ from aiortc import (
     RTCSessionDescription
 )
 from aiortc.contrib.signaling import candidate_from_sdp
+from aiortc.contrib.media import MediaPlayer
+import os
 
 # ─── Monkey‐patch asyncio DatagramTransport._fatal_error ───────────────
 for module_name, cls_name in (
@@ -57,9 +59,9 @@ RETRY_BASE = 0.5
 LEG_PAIR_WIDTH = 168   # mm, distance between left/right legs
 LEG_PAIR_LENGTH = 305  # mm, distance between front/back legs
 BASE_HEIGHT = 150      # mm
-L_HIP = 30            # mm (Hip offset)
-L_UPPER = 120         # mm (Upper leg length)
-L_LOWER = 150         # mm (Lower leg length)
+L_HIP = 30             # mm (Hip offset)
+L_UPPER = 120          # mm (Upper leg length)
+L_LOWER = 150          # mm (Lower leg length)
 
 # ============== GLOBAL VARIABLES ==============
 # Control variables
@@ -435,6 +437,8 @@ def update_simulation_leg(target, keys, backstep_state, leg_num):
     return [x, y, z], backstep_state
 
 turn_mode = False
+ai_mode = False
+
 async def key_handling():
     global rotation_mode, leg_keys, reset_state, turn_mode, ai_mode, gait_speed
     
@@ -451,20 +455,12 @@ async def key_handling():
     
     # Check for mode transitions
     if (current_keystates.get('q', False) or current_keystates.get('e', False)) and not rotation_mode:
-        # print("[key_handling] Switching to rotation mode")
-        # for leg in leg_keys:
-        #     for direction in leg_keys[leg]:
-        #         leg_keys[leg][direction] = False
-        # await reset_function(reset_to_wasd=False, reset_to_rotation=True, reset_positions_only=False)
         return
 
     if (current_keystates.get('a', False) or current_keystates.get('d', False)) and not turn_mode:
         print("[key_handling] Switching to turn mode")
         turn_mode = True
-        if ai_mode:
-            gait_speed = 10
-        else:
-            gait_speed = 20
+        gait_speed = 10 if ai_mode else 20
         for leg in leg_keys:
             for direction in leg_keys[leg]:
                 leg_keys[leg][direction] = False
@@ -644,7 +640,53 @@ class TestVideoTrack(VideoStreamTrack):
         self.c += 1
         return vf
 
-ai_mode = False
+# ============== AUDIO CAPTURE (webcam mic) ==============
+def _make_audio_player():
+    preferred = os.getenv("LAIRA_AUDIO_DEVICE")
+    fmt = os.getenv("LAIRA_AUDIO_FORMAT") or "alsa"
+
+    attempts = []
+    if preferred:
+        attempts.append((preferred, fmt))
+
+    # Use the correct card/device ID
+    attempts += [
+        ("hw:2,0", "alsa"),
+        ("plughw:2,0", "alsa"),
+        ("hw:C960,0", "alsa"),
+        ("plughw:C960,0", "alsa"),
+        ("sysdefault:CARD=C960", "alsa"),
+        ("default", "alsa"),
+        ("default", "pulse"),
+    ]
+
+    for src, f in attempts:
+        try:
+            player = MediaPlayer(
+                src,
+                format=f,
+                options={
+                    "channels": "1",
+                    "sample_rate": "48000",
+                    "ac": "1",
+                    "ar": "48000",
+                }
+            )
+            if player and player.audio:
+                print(f"[audio] using input: {src} (format={f})")
+                return player
+        except Exception as e:
+            print(f"[audio] try {src} (format={f}) → {e}")
+
+    print("[audio] no input found; starting without mic")
+    return None
+
+
+
+
+
+
+
 # ============== WEBSOCKET MESSAGE HANDLING ==============
 async def handle_message(msg):
     """Process incoming WebSocket messages for robot control"""
@@ -655,7 +697,6 @@ async def handle_message(msg):
     ws_last_message_time = time.time()
     
     try:
-        # Get the message content
         if 'message' not in msg:
             return
             
@@ -666,8 +707,13 @@ async def handle_message(msg):
             ctrl.motor_off(SERVO_ID_ALL)
             motors_resting = True
             return
-        # Check if this is a control message with 'value'
-        if 'keystates' in message or 'ik' in message or 'angle' in message or 'aimode' in message:
+        if 'shake' in message:
+            ctrl.motor_off(14)
+            ctrl.motor_off(15)
+            motors_resting = True
+            return
+
+        if 'keystates' in message or 'ik' in message or 'angle' in message or 'aimode' in message or 'noaimode' in message:
             if motors_resting:
                 ctrl.motor_on(SERVO_ID_ALL)
                 motors_resting = False
@@ -677,13 +723,12 @@ async def handle_message(msg):
 
             if 'noaimode' in message:
                 ai_mode = False
-                
+                gait_speed = 20
                 return
             elif 'aimode' in message:
                 ai_mode = True
-                
+                gait_speed = 10
             
-            # Handle parsed inner object
             if 'ik' in message:
                 in_animation = True
                 await run_animation(inner['ik'], 'ik')
@@ -692,15 +737,11 @@ async def handle_message(msg):
                 in_animation = True
                 await run_animation(inner['fastangle'], 'fastangle')
                 print("Fast Angle command:", inner['fastangle'])
-                
             elif 'angle' in message:
                 in_animation = True
                 await run_animation(inner['angle'], 'angle')
                 print("Angle command:", inner['angle'])
-            
             elif 'keystates' in message:
-                # This handles the case where keystates are properly parsed
-                # Check if we need to exit animation mode
                 if in_animation:
                     for key, value in inner['keystates'].items():
                         if value:
@@ -708,23 +749,16 @@ async def handle_message(msg):
                             in_animation = False
                             in_angle_mode = False
                             break
-                
-                # Update keystates
                 if not in_animation:
                     new_keystates = inner['keystates']
-                    
-                    # Convert string values to boolean if needed
                     for key in new_keystates:
                         if isinstance(new_keystates[key], str):
                             new_keystates[key] = (new_keystates[key].lower() == 'true')
-                    
-                    # Update global keystates
                     async with keystates_lock:
                         for key in new_keystates:
                             if key in keystates:
                                 keystates[key] = new_keystates[key]
-                    
-                    print("Keystates updated:", keystates)
+                    # print("Keystates updated:", keystates)
                     
     except Exception as e:
         print(f"Error handling message: {e}")
@@ -739,13 +773,10 @@ async def websocket_health_monitor():
             current_time = time.time()
             time_since_last_message = current_time - ws_last_message_time
             
-            # Check if we haven't received messages in a while
             if time_since_last_message > WS_TIMEOUT:
                 if ws_healthy:
                     print(f"⚠️ WebSocket unhealthy - no messages for {time_since_last_message:.1f}s")
                     ws_healthy = False
-                    
-                    # Try to close the existing connection to trigger reconnect
                     if ws_connection and not ws_connection.closed:
                         print("🔄 Forcing WebSocket reconnection...")
                         await ws_connection.close()
@@ -754,7 +785,6 @@ async def websocket_health_monitor():
                     print("✅ WebSocket health restored")
                     ws_healthy = True
             
-            # Send periodic ping to keep connection alive
             if ws_connection and not ws_connection.closed and ws_healthy:
                 try:
                     await ws_connection.ping()
@@ -772,10 +802,17 @@ async def websocket_health_monitor():
 async def make_pc(ice_servers):
     config = RTCConfiguration([RTCIceServer(**srv) for srv in ice_servers])
     pc = RTCPeerConnection(config)
+
+    # Video track
     real = USBVideoTrack()
     track = real if real.cap else TestVideoTrack()
     pc.addTrack(track)
     pc._video_track = track
+
+    # Audio track
+    pc._audio_player = _make_audio_player()
+    if pc._audio_player and pc._audio_player.audio:
+        pc.addTrack(pc._audio_player.audio)
 
     @pc.on("iceconnectionstatechange")
     def ice_change():
@@ -814,14 +851,14 @@ async def websocket_handler():
             queue = []
             got_offer = False
 
-            # Create WebSocket with shorter timeouts for faster failure detection
+            # Connect to broker
             async with websockets.connect(
                 WS_URL,
-                ping_interval=10,  # Reduced from 20
-                ping_timeout=10,   # Reduced from 20
-                close_timeout=5,   # Increased from 1
-                max_size=10**7,    # Add max message size
-                compression=None   # Disable compression for lower latency
+                ping_interval=10,
+                ping_timeout=10,
+                close_timeout=5,
+                max_size=10**7,
+                compression=None
             ) as ws:
                 ws_connection = ws
                 ws_last_message_time = time.time()
@@ -845,7 +882,6 @@ async def websocket_handler():
                 # Message handling loop with timeout
                 while True:
                     try:
-                        # Use wait_for to add timeout to recv()
                         raw = await asyncio.wait_for(ws.recv(), timeout=WS_TIMEOUT)
                         ws_last_message_time = time.time()
                         
@@ -921,6 +957,12 @@ async def websocket_handler():
             if pc:
                 if hasattr(pc, "_video_track"):
                     pc._video_track.stop()
+                # Stop audio capture if present
+                if hasattr(pc, "_audio_player") and pc._audio_player:
+                    try:
+                        pc._audio_player.stop()
+                    except Exception:
+                        pass
                 await pc.close()
             
             # Exponential backoff for reconnection
@@ -933,12 +975,10 @@ async def main():
     """Main async function that runs control loop, WebSocket handler, and health monitor"""
     print("🤖 Starting unified robot control system...")
     
-    # Create tasks for all loops
     control_task = asyncio.create_task(control_loop())
     websocket_task = asyncio.create_task(websocket_handler())
     health_task = asyncio.create_task(websocket_health_monitor())
     
-    # Run all tasks concurrently
     await asyncio.gather(control_task, websocket_task, health_task)
 
 if __name__ == "__main__":
