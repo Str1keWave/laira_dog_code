@@ -50,7 +50,7 @@ TURN_URL = (
 
 # Motor control configuration
 running_motors = True  # Set to False to disable motor control (simulation mode)
-SERIAL_PORT = '/dev/ttyUSB0'
+SERIAL_PORT = '/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0'
 BAUD = 115200
 MAX_RETRY = 30
 RETRY_BASE = 0.5
@@ -451,7 +451,8 @@ async def key_handling():
     # Debug: print if we have any active keys
     active = [k for k, v in current_keystates.items() if v]
     if active:
-        print(f"[key_handling] Active keys: {active}, Rotation mode: {rotation_mode}")
+        # print(f"[key_handling] Active keys: {active}, Rotation mode: {rotation_mode}")
+        pass
     
     # Check for mode transitions
     if (current_keystates.get('q', False) or current_keystates.get('e', False)) and not rotation_mode:
@@ -698,11 +699,14 @@ async def handle_message(msg):
     
     try:
         if 'message' not in msg:
+            print(f"msg recieved not with msg, prolly health packet")
             return
             
         message = msg['message']
-        print(json.loads(message))
-        
+        # print(json.loads(message)) #UNCOMMENT TO SEE ALL MESSAGES PRINTED
+        if 'alive' in message:
+            print("health ping recieved!")
+            return
         if 'rest' in message:
             ctrl.motor_off(SERVO_ID_ALL)
             motors_resting = True
@@ -763,6 +767,18 @@ async def handle_message(msg):
     except Exception as e:
         print(f"Error handling message: {e}")
 
+def _ws_is_open(ws):
+    try:
+        # Old versions expose .closed (bool)
+        if hasattr(ws, "closed"):
+            return not ws.closed
+        # Newer versions expose .state (enum with .name like "OPEN")
+        state = getattr(ws, "state", None)
+        return getattr(state, "name", "").upper() in ("OPEN", "CONNECTING")
+    except Exception:
+        return False
+
+
 # ============== WEBSOCKET HEALTH MONITORING ==============
 async def websocket_health_monitor():
     """Monitor WebSocket health and trigger reconnection if needed"""
@@ -777,7 +793,7 @@ async def websocket_health_monitor():
                 if ws_healthy:
                     print(f"⚠️ WebSocket unhealthy - no messages for {time_since_last_message:.1f}s")
                     ws_healthy = False
-                    if ws_connection and not ws_connection.closed:
+                    if _ws_is_open(ws_connection):
                         print("🔄 Forcing WebSocket reconnection...")
                         await ws_connection.close()
             else:
@@ -785,12 +801,6 @@ async def websocket_health_monitor():
                     print("✅ WebSocket health restored")
                     ws_healthy = True
             
-            if ws_connection and not ws_connection.closed and ws_healthy:
-                try:
-                    await ws_connection.ping()
-                except Exception as e:
-                    print(f"⚠️ Ping failed: {e}")
-                    ws_healthy = False
             
             await asyncio.sleep(WS_PING_INTERVAL)
             
@@ -837,15 +847,21 @@ async def websocket_handler():
     reconnect_delay = 1
     max_reconnect_delay = 30
     
+    TURN_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=10, sock_connect=10, sock_read=10)
+
     while True:
         ws_connection = None
         pc = None
         
         try:
             # Get TURN credentials
-            async with aiohttp.ClientSession() as sess:
-                resp = await sess.get(TURN_URL)
-                ice_servers = await resp.json()
+            async with aiohttp.ClientSession(timeout=TURN_TIMEOUT) as sess:
+
+                async with sess.get(TURN_URL) as resp:
+                    resp.raise_for_status()
+                    ice_servers = await resp.json()
+
+              
 
             pc = await make_pc(ice_servers)
             queue = []
@@ -858,8 +874,24 @@ async def websocket_handler():
                 ping_timeout=10,
                 close_timeout=5,
                 max_size=10**7,
+                max_queue=32,
                 compression=None
             ) as ws:
+                import socket
+                sock = None
+                try:
+                    # Some websockets versions expose ws.transport; guard just in case.
+                    transport = getattr(ws, "transport", None)
+                    if transport is not None:
+                        sock = transport.get_extra_info("socket")
+                    if isinstance(sock, socket.socket):
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)   # seconds
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                except Exception as e:
+                    print(f"[keepalive] could not set TCP keepalive: {e}")
+
                 ws_connection = ws
                 ws_last_message_time = time.time()
                 ws_healthy = True
@@ -870,7 +902,7 @@ async def websocket_handler():
 
                 @pc.on("icecandidate")
                 async def send_ice(cand):
-                    if cand and ws_connection and not ws_connection.closed:
+                    if cand and _ws_is_open(ws_connection):
                         try:
                             await ws_connection.send(json.dumps({
                                 "type": "ice-candidate",
@@ -901,30 +933,26 @@ async def websocket_handler():
                         msg_type = msg.get("type")
                         
                         if msg_type == "offer":
-                            if not got_offer:
-                                print("📬 Received OFFER → sending answer")
-                                await pc.setRemoteDescription(
-                                    RTCSessionDescription(sdp=msg["sdp"], type="offer")
-                                )
-                                got_offer = True
-                                
-                                # Process queued ICE candidates
-                                for c in queue:
-                                    ice = candidate_from_sdp(c["candidate"])
-                                    ice.sdpMid, ice.sdpMLineIndex = c.get("sdpMid"), c.get("sdpMLineIndex")
-                                    await pc.addIceCandidate(ice)
-                                queue.clear()
-                                
-                                # Create and send answer
-                                ans = await pc.createAnswer()
-                                await pc.setLocalDescription(ans)
-                                await ws.send(json.dumps({
-                                    "type": pc.localDescription.type,
-                                    "sdp": pc.localDescription.sdp
-                                }))
-                            else:
+
+                            if got_offer:
                                 print("⚠️ Duplicate OFFER → reconnecting")
                                 break
+                            print("📬 Received OFFER")
+                            await pc.setRemoteDescription(RTCSessionDescription(sdp=msg["sdp"], type="offer"))
+                            got_offer = True
+
+                            # flush queued ICE
+                            for c in queue:
+                                ice = candidate_from_sdp(c["candidate"])
+                                ice.sdpMid, ice.sdpMLineIndex = c.get("sdpMid"), c.get("sdpMLineIndex")
+                                await pc.addIceCandidate(ice)
+                            queue.clear()
+                            ans = await pc.createAnswer()
+                            await pc.setLocalDescription(ans)
+                            await ws.send(json.dumps({
+                                "type": pc.localDescription.type,
+                                "sdp": pc.localDescription.sdp
+                            }))
 
                         elif msg_type == "ice-candidate":
                             c = msg["candidate"]
@@ -944,8 +972,9 @@ async def websocket_handler():
                     except Exception as e:
                         print(f"Error processing message: {e}")
 
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(f"⚠️ Failed to get TURN credentials: {e}")
+
         except Exception as e:
             print(f"⚠️ WebSocket error: {e}")
 
@@ -955,15 +984,18 @@ async def websocket_handler():
             
             # Clean up peer connection
             if pc:
-                if hasattr(pc, "_video_track"):
-                    pc._video_track.stop()
-                # Stop audio capture if present
-                if hasattr(pc, "_audio_player") and pc._audio_player:
-                    try:
-                        pc._audio_player.stop()
-                    except Exception:
-                        pass
-                await pc.close()
+                try:
+                    if hasattr(pc, "_video_track"):
+                        pc._video_track.stop()
+                    # Stop audio capture if present
+                    if hasattr(pc, "_audio_player") and pc._audio_player:
+                        try:
+                            pc._audio_player.stop()
+                        except Exception:
+                            pass
+                    await pc.close()
+                except Exception as e:
+                    print(f"[pc.close] {e}")
             
             # Exponential backoff for reconnection
             print(f"⏳ Reconnecting in {reconnect_delay}s...")
